@@ -1,0 +1,12 @@
+{
+  "name": "historial",
+  "description": "Historial: barra lateral con tus conversaciones de Claude Code.",
+  "owner": { "name": "waldooCreator" },
+  "plugins": [
+    {
+      "name": "historial",
+      "source": "./",
+      "description": "Conversaciones recientes de Claude Code en una barra lateral pixel art, con fijadas y carpetas."
+    }
+  ]
+}
