@@ -1,7 +1,8 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 const PANE = 'historial'
 const LIMIT = 60
+const TICK_MS = 150
 
 type Chat = { id: string; title: string; cwd: string; mtime: number }
 type Folder = { id: string; name: string; isOpen: boolean; chats: string[] }
@@ -34,17 +35,6 @@ const FONT: Record<string, string[]> = {
   L: ['100', '100', '100', '100', '111'],
 }
 
-// A folder with a pin, 9x7 pixels.
-const ICON = [
-  '.........',
-  '.OOO.....',
-  'OHHHOOOOO',
-  'OHHHHHHHO',
-  'OHHHHHHHO',
-  'OHHHHHHHO',
-  'OOOOOOOOO',
-]
-
 let chats: Chat[] = []
 let pinned: string[] = []
 let isLoading = false
@@ -53,6 +43,10 @@ let isOpen = false
 let folders: Folder[] = []
 let moving: string | undefined
 let isNaming = false
+let isRecentOpen = true
+let tick = 0
+let ticker: Timer | undefined
+let mounted: { columns: number; rows: number } | undefined
 
 const age = (ms: number) => {
   const s = Math.max(0, (Date.now() - ms) / 1000)
@@ -67,9 +61,30 @@ const clip = (s: string, n: number) => (s.length > n ? s.slice(0, Math.max(1, n 
 const folder = (cwd: string) => cwd.split('/').filter(Boolean).pop() ?? '~'
 const quote = (s: string) => `'${s.replaceAll("'", `'\\''`)}'`
 
+// Clawd, 16x5: `#` body, `e` eye, `l` leg.
+const CLAWD = {
+  stand: ['..############..', '..##e######e##..', '################', '..############..', '...l.l....l.l...'],
+  walk: ['..############..', '..##e######e##..', '################', '..############..', '..l.l......l.l..'],
+  cheer: ['#.############.#', '#.##e######e##.#', '..############..', '..############..', '...l.l....l.l...'],
+}
+const SPARK = [[0, 1], [-1, 0], [0, 0], [1, 0], [0, -1]]
+const WORD = 'HISTORIAL'
+
+type Layout = { rows: number; scale: number; isStacked: boolean; hasClawd: boolean }
+
+/** Picks the banner's size for the pane's width: the word as large as it fits. */
+const layoutFor = (columns: number): Layout => {
+  if (columns >= 93) return { rows: 7, scale: 2, isStacked: false, hasClawd: true }
+  if (columns >= 74) return { rows: 10, scale: 2, isStacked: true, hasClawd: true }
+  if (columns >= 58) return { rows: 4, scale: 1, isStacked: false, hasClawd: true }
+  if (columns >= 37) return { rows: 8, scale: 1, isStacked: true, hasClawd: true }
+
+  return { rows: 4, scale: 1, isStacked: false, hasClawd: false }
+}
+
 /** The banner as terminal cells: two pixels per cell (upper half block). */
-const banner = (columns: number) => {
-  const rows = 4
+const banner = (columns: number, tick: number) => {
+  const { rows, scale, isStacked, hasClawd } = layoutFor(columns)
   const h = rows * 2
   const px: number[][] = Array.from({ length: h }, (_, y) =>
     Array.from({ length: columns }, (_, x) => ((x + y) % 2 === 0 ? C.bg : C.bgAlt)),
@@ -81,26 +96,54 @@ const banner = (columns: number) => {
     put(x, 0, C.edge)
     put(x, h - 1, C.edge)
   }
-  ICON.forEach((line, y) =>
-    [...line].forEach((ch, x) => {
-      if (ch === 'O') put(2 + x, 1 + y, C.orange)
-      if (ch === 'H') put(2 + x, 1 + y, C.orangeHi)
-    }),
-  )
-  put(8, 3, C.gold)
-  put(9, 3, C.gold)
-  put(8, 4, C.gold)
-  put(9, 4, C.gold)
-  let x0 = 13
-  for (const letter of 'HISTORIAL') {
-    FONT[letter].forEach((line, y) =>
-      [...line].forEach((bit, x) => {
-        if (bit === '1') put(x0 + x + 1, 2 + y, C.dim)
-        if (bit === '1') put(x0 + x, 1 + y, C.cream)
+
+  // The word, `scale` pixels per font pixel, with a dark one-pixel drop shadow.
+  const wordW = WORD.length * 3 * scale + (WORD.length - 1) * scale
+  const wordH = 5 * scale
+  const clawdW = hasClawd ? 16 : 0
+  const wordX = isStacked
+    ? Math.max(1, Math.floor((columns - wordW) / 2))
+    : hasClawd
+      ? Math.min(2 + clawdW + 3, Math.max(1, columns - wordW - 1))
+      : Math.max(1, Math.floor((columns - wordW) / 2))
+  const wordY = isStacked ? h - 1 - wordH - 1 : Math.floor((h - wordH) / 2)
+  let x0 = wordX
+  for (const letter of WORD) {
+    FONT[letter].forEach((line, fy) =>
+      [...line].forEach((bit, fx) => {
+        if (bit !== '1') return
+        for (let dy = 0; dy < scale; dy++) {
+          for (let dx = 0; dx < scale; dx++) {
+            put(x0 + fx * scale + dx + 1, wordY + fy * scale + dy + 1, 0x7a3b2e)
+            put(x0 + fx * scale + dx, wordY + fy * scale + dy, C.cream)
+          }
+        }
       }),
     )
-    x0 += 4
+    x0 += 4 * scale
   }
+
+  // Clawd: blinks, hops, shuffles its feet and now and then cheers.
+  if (hasClawd) {
+    const cheer = tick % 64 < 8
+    const frame = cheer ? CLAWD.cheer : tick % 12 < 6 ? CLAWD.stand : CLAWD.walk
+    const isBlink = tick % 26 < 2
+    const hop = cheer ? (tick % 4 < 2 ? -1 : 0) : tick % 12 < 6 ? 0 : -1
+    const cx = isStacked ? Math.floor((columns - clawdW) / 2) : 2
+    const cy = isStacked ? 3 : wordY + wordH - 5 + 1
+    frame.forEach((line, j) =>
+      [...line].forEach((ch, i) => {
+        if (ch === '.') return
+        const color = ch === 'e' ? (isBlink ? 0x8c3f2b : 0x2a1a14) : ch === 'l' ? 0xb5603f : C.orange
+        put(cx + i, cy + j + hop, color)
+      }),
+    )
+    // A twinkle that wanders around its head.
+    const spots = [[-3, 0], [clawdW + 2, 1], [clawdW + 1, -2], [-2, 3]]
+    const [sx, sy] = spots[Math.floor(tick / 8) % spots.length]
+    if (tick % 8 < 6) SPARK.forEach(([dx, dy]) => put(cx + sx + dx + 1, cy + sy + dy + 1, tick % 16 < 8 ? C.gold : C.cream))
+  }
+
   const words = new Uint32Array(columns * rows * 3)
   for (let r = 0; r < rows; r++) {
     for (let x = 0; x < columns; x++) {
@@ -121,6 +164,7 @@ async function load($: EngineInterface): Promise<void> {
   $.ui.invalidate('ui.render')
   try {
     pinned = ((await $.store.get('pinned')) as string[] | undefined) ?? []
+    isRecentOpen = (await $.store.get('recentOpen')) !== false
     folders = ((await $.store.get('folders')) as Folder[] | undefined) ?? []
     try {
       const seed = JSON.parse(await $.fs.read(`${$.plugin.root}/hooks/semilla.json`) as string) as {
@@ -156,14 +200,37 @@ async function load($: EngineInterface): Promise<void> {
   }
 }
 
+function startTicking($: EngineInterface): void {
+  if (ticker) return
+  ticker = $.clock.every(TICK_MS, () => void frame($))
+}
+
+function stopTicking(): void {
+  ticker?.cancel()
+  ticker = undefined
+  mounted = undefined
+}
+
+async function frame($: EngineInterface): Promise<void> {
+  tick++
+  const drawn = mounted
+  if (!drawn) return
+  const art = banner(drawn.columns, tick)
+  const blit = await $.ui.blit({ requestId: PANE, key: 'banner', cells: art.cells, columns: drawn.columns, rows: art.rows })
+  // Not drawn any more (closed or resized): wait for the next render.
+  if (blit.deny && mounted === drawn) mounted = undefined
+}
+
 async function toggle($: EngineInterface): Promise<void> {
   const open = (await $.ui.panes()).some(p => p.id === PANE)
   if (open) {
     await $.ui.close({ id: PANE })
     isOpen = false
+    stopTicking()
   } else {
     await $.ui.open({ id: PANE, title: 'Historial', focus: true })
     isOpen = true
+    startTicking($)
     void load($)
   }
   $.ui.invalidate('ui.render')
@@ -186,6 +253,12 @@ async function createFolder($: EngineInterface, name: string): Promise<void> {
   const clean = name.trim().slice(0, 40)
   if (!clean) return $.ui.invalidate('ui.render')
   await saveFolders($, [...folders, { id: `f${Date.now().toString(36)}`, name: clean, isOpen: true, chats: [] }])
+}
+
+async function toggleRecent($: EngineInterface): Promise<void> {
+  isRecentOpen = !isRecentOpen
+  await $.store.set('recentOpen', isRecentOpen)
+  $.ui.invalidate('ui.render')
 }
 
 async function toggleFolder($: EngineInterface, id: string): Promise<void> {
@@ -248,7 +321,10 @@ export const register: Register = on => {
 
   on('ui.close', async ($, e, next) => {
     const result = await next(e)
-    if (e.id === PANE) isOpen = false
+    if (e.id === PANE) {
+      isOpen = false
+      stopTicking()
+    }
 
     return result
   }).catch(($, e, next) => next(e))
@@ -270,7 +346,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Raster, Input } = $.ui.resolve(e)
     const columns = Math.min(120, Math.max(24, e.props.bodyColumns))
-    const art = banner(columns)
+    const art = banner(columns, tick)
+    mounted = { columns, rows: art.rows }
+    startTicking($)
     const byId = new Map(chats.map(c => [c.id, c]))
     const inFolder = new Set(folders.flatMap(f => f.chats))
     const fixed = pinned.map(id => byId.get(id)).filter((c): c is Chat => !!c)
@@ -279,7 +357,7 @@ export const register: Register = on => {
     const folderOf = (id: string) => folders.find(f => f.chats.includes(id))?.name
 
     const row = (c: Chat, indent = '', tag = false) => (
-      <Box key={`row-${c.id}`} flexDirection="column">
+      <Box key={`row-${c.id}`} flexDirection="column" marginBottom={1}>
         <Box flexDirection="row">
           <Text>{indent}</Text>
           <Button key={`pin-${c.id}`} plain onPress={() => void pin($, c.id)}>
@@ -351,13 +429,16 @@ export const register: Register = on => {
             <Text color={C.accent}>＋ nueva carpeta</Text>
           </Button>
         )}
-        <Text color={C.accent}>▀▀ RECIENTES ▀▀</Text>
+        <Button key="recientes" plain onPress={() => void toggleRecent($)}>
+          <Text color={C.accent}>{isRecentOpen ? '▼' : '▶'} ▀▀ RECIENTES ▀▀</Text>
+          <Text color={C.muted}> ({rest.length})</Text>
+        </Button>
         {moving && inFolder.has(moving) && (
           <Button key="out" plain onPress={() => void dropInto($, undefined)}>
             <Text color={C.accent}>⮑ sacar de su carpeta</Text>
           </Button>
         )}
-        {rest.map(c => row(c))}
+        {isRecentOpen && rest.map(c => row(c))}
         <Text color={C.muted}>▄▄▄ {chats.length} conversaciones ▄▄▄</Text>
       </Box>
     )

@@ -1,6 +1,6 @@
 {
   "name": "historial",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Barra lateral pixel art con las conversaciones recientes de Claude Code: fija las importantes, ordénalas en carpetas y reábrelas en una pestaña nueva de tu terminal.",
   "author": { "name": "waldooCreator" }
 }

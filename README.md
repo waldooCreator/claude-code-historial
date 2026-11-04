@@ -32,11 +32,12 @@ claude --plugin-dir ./claude-code-historial
 
 ## Qué hace
 
-- 🕘 **Recientes**: lee `~/.claude/projects` y lista las conversaciones de la más nueva a la más vieja, con el resumen del tema como título, la carpeta del proyecto y hace cuánto fue.
+- 🕘 **Recientes**: lee `~/.claude/projects` y lista las conversaciones de la más nueva a la más vieja, con el resumen del tema como título, la carpeta del proyecto y hace cuánto fue. Un clic en `▼ RECIENTES` pliega la lista y lo recuerda.
 - ★ **Fijadas**: la estrella fija una conversación para que salga siempre arriba.
 - ▣ **Carpetas**: crea carpetas con `＋ nueva carpeta`, ábrelas y ciérralas con un clic. Para meter un chat, pulsa su `▢` y luego `⮑ aquí` en la carpeta; `⮑ sacar de su carpeta` lo devuelve a recientes.
 - 🖱️ **Reabrir**: un clic en el título abre `claude --resume` en una pestaña nueva de Ptyxis, en la carpeta donde se creó la conversación.
 - `/historial` abre y cierra la barra desde el teclado.
+- 🦀 **Cabecera animada**: Clawd parpadea, salta y celebra junto a HISTORIAL, que crece con el ancho de la barra.
 
 La barra se acopla al lado del chat en pantalla completa con 110 columnas o más; con menos, se abre sobre el prompt.
 
