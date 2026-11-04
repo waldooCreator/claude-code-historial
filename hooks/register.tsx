@@ -3,9 +3,13 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 const PANE = 'historial'
 const LIMIT = 60
 const TICK_MS = 150
+// While the bar is open it looks for what other sessions changed every ~1 s.
+const SYNC_TICKS = 6
 
 type Chat = { id: string; title: string; cwd: string; mtime: number; path?: string; prev?: string }
 type Folder = { id: string; name: string; isOpen: boolean; chats: string[] }
+// What every session shares through one file: ~/.claude/historial/estado.json.
+type Shared = { pinned: string[]; folders: Folder[]; isRecentOpen: boolean; links: Record<string, string> }
 // One chat as the list shows it: the conversation in use and, newest first, the
 // ones a /clear left behind under the same name.
 type Group = { head: Chat; members: Chat[] }
@@ -50,6 +54,9 @@ let isRecentOpen = true
 let tick = 0
 let ticker: Timer | undefined
 let mounted: { columns: number; rows: number } | undefined
+let file: string | undefined
+let seen = 0
+let queue: Promise<unknown> = Promise.resolve()
 // /clear links this mod saw happen: new session id → the one it cleared.
 let links: Record<string, string> = {}
 let groupOf = new Map<string, Group>()
@@ -166,35 +173,101 @@ const banner = (columns: number, tick: number) => {
   return { rows, cells: new Uint8Array(words.buffer).toBase64() }
 }
 
+/**
+ * One file for every session. The plugin's own store is not it: each install
+ * keeps a store of its own, and a session holds on to what it read, so a
+ * change made in one terminal never reached another.
+ */
+async function sharedPath($: EngineInterface): Promise<string> {
+  file ??= `${(await $.env.get('HOME')) ?? ''}/.claude/historial/estado.json`
+
+  return file
+}
+
+function apply(s: Shared): void {
+  pinned = s.pinned ?? []
+  folders = s.folders ?? []
+  isRecentOpen = s.isRecentOpen !== false
+  links = s.links ?? {}
+}
+
+/** Runs `work` after every read and write before it, so they never cross. */
+function inTurn<T>(work: () => Promise<T>): Promise<T> {
+  const done = queue.then(work)
+  queue = done.catch(() => undefined)
+
+  return done
+}
+
+/** The shared file as it is now, or undefined when no session has written it yet. */
+async function readShared($: EngineInterface): Promise<Shared | undefined> {
+  const path = await sharedPath($)
+  if (!(await $.fs.exists(path))) return undefined
+  // Another session may be halfway through writing it: try again.
+  for (let i = 0; ; i++) {
+    try {
+      const { mtimeMs } = await $.fs.stat(path)
+      const shared = JSON.parse((await $.fs.read(path)) as string) as Shared
+      seen = mtimeMs
+
+      return shared
+    } catch (error) {
+      if (i >= 4) throw error
+      await $.clock.sleep(40)
+    }
+  }
+}
+
+/** What this install kept in its own store before the shared file: where the file starts from. */
+async function fromStore($: EngineInterface): Promise<Shared> {
+  return {
+    pinned: ((await $.store.get('pinned')) as string[] | undefined) ?? [],
+    folders: ((await $.store.get('folders')) as Folder[] | undefined) ?? [],
+    isRecentOpen: (await $.store.get('recentOpen')) !== false,
+    links: ((await $.store.get('links')) as Record<string, string> | undefined) ?? {},
+  }
+}
+
+/** Applies `change` to what the file holds now, never to this session's copy, and writes it. */
+function save($: EngineInterface, change: (now: Shared) => Shared): Promise<boolean> {
+  return inTurn(async () => {
+    try {
+      const next = change((await readShared($)) ?? (await fromStore($)))
+      apply(next)
+      $.ui.invalidate('ui.render')
+      await $.fs.write(await sharedPath($), JSON.stringify(next, null, 1))
+
+      return true
+    } catch (error) {
+      $.ui.toast(`No pude guardar el historial: ${error instanceof Error ? error.message : String(error)}`)
+
+      return false
+    }
+  })
+}
+
+/** Picks up what another session wrote since this one last read the file. */
+function sync($: EngineInterface): Promise<void> {
+  return inTurn(async () => {
+    const stat = await $.fs.stat(await sharedPath($)).catch(() => undefined)
+    if (!stat || stat.mtimeMs === seen) return
+    const shared = await readShared($).catch(() => undefined)
+    if (!shared) return
+    apply(shared)
+    $.ui.invalidate('ui.render')
+    // A chat filed from another session that this one has not listed yet.
+    const listed = new Set(chats.map(c => c.id))
+    if ([...pinned, ...folders.flatMap(f => f.chats)].some(id => !listed.has(id))) void load($)
+  })
+}
+
 async function load($: EngineInterface): Promise<void> {
   if (isLoading) return
   isLoading = true
   failure = undefined
   $.ui.invalidate('ui.render')
   try {
-    pinned = ((await $.store.get('pinned')) as string[] | undefined) ?? []
-    links = ((await $.store.get('links')) as Record<string, string> | undefined) ?? {}
-    isRecentOpen = (await $.store.get('recentOpen')) !== false
-    folders = ((await $.store.get('folders')) as Folder[] | undefined) ?? []
-    try {
-      const seed = JSON.parse(await $.fs.read(`${$.plugin.root}/hooks/semilla.json`) as string) as {
-        id: string
-        folders: Record<string, string[]>
-      }
-      if ((await $.store.get('seed')) !== seed.id) {
-        folders = folders.map(f => {
-          const ids = seed.folders[f.name]
-
-          return ids ? { ...f, chats: [...ids, ...f.chats.filter(c => !ids.includes(c))] } : f
-        })
-        const taken = new Set(Object.values(seed.folders).flat())
-        folders = folders.map(f => (seed.folders[f.name] ? f : { ...f, chats: f.chats.filter(c => !taken.has(c)) }))
-        await $.store.set('folders', folders)
-        await $.store.set('seed', seed.id)
-      }
-    } catch {
-      // No seed file: nothing to import.
-    }
+    apply(await inTurn(async () => (await readShared($)) ?? (await fromStore($))))
     const keep = [...pinned, ...folders.flatMap(f => f.chats)]
     const run = await $.process.run(
       ['python3', '-I', `${$.plugin.root}/hooks/listar.py`, String(LIMIT), keep.join(',')],
@@ -223,9 +296,9 @@ function stopTicking(): void {
 
 async function frame($: EngineInterface): Promise<void> {
   tick++
-  // While the bar is open: what other sessions changed every 3 s, the list every 30 s.
+  // While the bar is open: what other sessions changed every ~1 s, the list every 30 s.
   if (tick % 200 === 0) void load($)
-  else if (tick % 20 === 0) void refresh($)
+  else if (tick % SYNC_TICKS === 0) void sync($)
   const drawn = mounted
   if (!drawn) return
   const art = banner(drawn.columns, tick)
@@ -251,26 +324,15 @@ async function toggle($: EngineInterface): Promise<void> {
 
 async function pin($: EngineInterface, id: string): Promise<void> {
   const ids = idsOf(groupOf.get(id), id)
-  const now = ((await $.store.get('pinned')) as string[] | undefined) ?? pinned
-  pinned = now.some(p => ids.includes(p)) ? now.filter(p => !ids.includes(p)) : [id, ...now]
-  await $.store.set('pinned', pinned)
-  $.ui.invalidate('ui.render')
+  await save($, s => ({
+    ...s,
+    pinned: s.pinned.some(p => ids.includes(p)) ? s.pinned.filter(p => !ids.includes(p)) : [id, ...s.pinned],
+  }))
 }
 
-/** Changes the folders on top of what the store holds now: another session may have changed them. */
+/** Changes the folders on top of what the shared file holds now: another session may have changed them. */
 async function saveFolders($: EngineInterface, change: (now: Folder[]) => Folder[]): Promise<void> {
-  const now = ((await $.store.get('folders')) as Folder[] | undefined) ?? folders
-  folders = change(now)
-  await $.store.set('folders', folders)
-  $.ui.invalidate('ui.render')
-}
-
-/** Rereads what other sessions may have changed: folders, pins and /clear links. */
-async function refresh($: EngineInterface): Promise<void> {
-  folders = ((await $.store.get('folders')) as Folder[] | undefined) ?? folders
-  pinned = ((await $.store.get('pinned')) as string[] | undefined) ?? pinned
-  links = ((await $.store.get('links')) as Record<string, string> | undefined) ?? links
-  $.ui.invalidate('ui.render')
+  await save($, s => ({ ...s, folders: change(s.folders) }))
 }
 
 /**
@@ -317,9 +379,7 @@ async function createFolder($: EngineInterface, name: string): Promise<void> {
 }
 
 async function toggleRecent($: EngineInterface): Promise<void> {
-  isRecentOpen = !isRecentOpen
-  await $.store.set('recentOpen', isRecentOpen)
-  $.ui.invalidate('ui.render')
+  await save($, s => ({ ...s, isRecentOpen: s.isRecentOpen === false }))
 }
 
 async function toggleFolder($: EngineInterface, id: string): Promise<void> {
@@ -402,9 +462,11 @@ async function trash($: EngineInterface, id: string): Promise<void> {
 
     return $.ui.invalidate('ui.render')
   }
-  await saveFolders($, now => now.map(f => ({ ...f, chats: f.chats.filter(c => !ids.includes(c)) })))
-  pinned = (((await $.store.get('pinned')) as string[] | undefined) ?? pinned).filter(p => !ids.includes(p))
-  await $.store.set('pinned', pinned)
+  await save($, s => ({
+    ...s,
+    folders: s.folders.map(f => ({ ...f, chats: f.chats.filter(c => !ids.includes(c)) })),
+    pinned: s.pinned.filter(p => !ids.includes(p)),
+  }))
   chats = chats.filter(c => !ids.includes(c.id))
   $.ui.toast('Movida a la papelera: ~/.claude/historial-papelera')
   $.ui.invalidate('ui.render')
@@ -428,9 +490,7 @@ async function linkClear($: EngineInterface, cleared: string): Promise<void> {
     const now = await $.session.id()
     if (now && now !== cleared) {
       currentId = now
-      const saved = ((await $.store.get('links')) as Record<string, string> | undefined) ?? {}
-      links = { ...saved, [now]: cleared }
-      await $.store.set('links', links)
+      await save($, s => ({ ...s, links: { ...s.links, [now]: cleared } }))
 
       return
     }

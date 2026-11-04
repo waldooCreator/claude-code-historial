@@ -1,19 +1,50 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 type Folder = { id: string; name: string; isOpen: boolean; chats: string[] }
-type World = { store: Record<string, unknown>; runs: string[][]; chats: unknown[]; env: Record<string, string> }
+type World = {
+  store: Record<string, unknown>
+  runs: string[][]
+  chats: unknown[]
+  env: Record<string, string>
+  files?: Map<string, { text: string; mtimeMs: number }>
+}
+type Shared = { pinned: string[]; folders: Folder[]; isRecentOpen: boolean; links: Record<string, string> }
 
 const NOW = Date.now()
+const FILE = '/home/usuario/.claude/historial/estado.json'
+let written = 0
 
-// The engine beneath the mod: an in-memory store, the reader's output, a pane.
+/** Writes a file of the in-memory disk, as another session would. */
+const put = (world: World, path: string, text: string) => world.files?.set(path, { text, mtimeMs: ++written })
+/** The shared file every session reads and writes, when one has. */
+const shared = (world: World) => {
+  const file = world.files?.get(FILE)
+
+  return file ? (JSON.parse(file.text) as Shared) : undefined
+}
+const foldersOf = (world: World) => shared(world)?.folders ?? (world.store.folders as Folder[])
+
+// The engine beneath the mod: an in-memory store and disk, the reader's output, a pane.
 function engine(on: On, world: World): void {
   let pane: { id: string; title: string; isShown: boolean; isFocused: boolean; isPlaced: boolean } | undefined
+  world.files ??= new Map()
+  const files = world.files
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.id', () => ({ value: 'sesion-actual' }))
   on('session.cwd', () => ({ value: '/home/usuario' }))
-  on('env.get', (_$, e) => ({ value: world.env[e.name] }))
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/usuario' : world.env[e.name] }))
+  on('fs.exists', (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_$, e) => (files.has(e.path) ? { value: files.get(e.path)!.text } : { deny: 'ENOENT' }) as never)
+  on('fs.write', (_$, e) => {
+    put(world, e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.stat', (_$, e) => {
+    const file = files.get(e.path)
+    return (file ? { value: { kind: 'file', size: file.text.length, mtimeMs: file.mtimeMs, isLink: false } } : { deny: 'ENOENT' }) as never
+  })
   on('store.get', (_$, e) => ({ value: world.store[e.key] }) as never)
   on('store.set', (_$, e) => {
     world.store[e.key] = e.value
@@ -124,7 +155,8 @@ test('borrar un chat de una carpeta pide confirmación y lo manda a la papelera 
   await ui.press({ key: 'yes-nuevo' })
   const trash = world.runs.find(r => r.join(' ').includes('papelera.py'))
   expect(trash?.slice(-2).sort()).toEqual(['nuevo', 'viejo'])
-  expect((world.store.folders as Folder[])[0]?.chats).toEqual([])
+  expect(foldersOf(world)[0]?.chats).toEqual([])
+  expect(shared(world)?.pinned).toEqual([])
   const drawn = await text(ui)
   expect(drawn).not.toContain('Nómina')
   expect(drawn).toContain('Cartera')
@@ -142,7 +174,7 @@ test('no se puede borrar la conversación en la que estás', async ($, on) => {
   await ui.press({ key: 'del-sesion-actual' })
   await ui.press({ key: 'yes-sesion-actual' })
   expect(world.runs.some(r => r.join(' ').includes('papelera.py'))).toBe(false)
-  expect((world.store.folders as Folder[])[0]?.chats).toEqual(['sesion-actual'])
+  expect(foldersOf(world)[0]?.chats).toEqual(['sesion-actual'])
 })
 
 test('＋ chat abre una sesión nueva que se guarda sola en esa carpeta', async ($, on) => {
@@ -171,5 +203,93 @@ test('una sesión abierta con HISTORIAL_CARPETA se guarda en esa carpeta al empe
   }
   engine(on, world)
   await $.session.start({ source: 'startup', cwd: '/proyectos/x', surface: 'terminal', isInteractive: true } as never)
-  expect((world.store.folders as Folder[])[0]).toMatchObject({ isOpen: true, chats: ['sesion-actual', 'a'] })
+  expect(foldersOf(world)[0]).toMatchObject({ isOpen: true, chats: ['sesion-actual', 'a'] })
+})
+
+test('lo que otra sesión guarda aparece en la barra abierta en un segundo, sin recargar', async ($, on) => {
+  const world: World = {
+    store: {},
+    runs: [],
+    env: {},
+    chats: [
+      { id: 'a', title: 'Algo', cwd: '/tmp', mtime: NOW },
+      { id: 'b', title: 'Cartera', cwd: '/tmp', mtime: NOW - 60_000 },
+    ],
+  }
+  engine(on, world)
+  const clock = mock.clock(on)
+  put(world, FILE, JSON.stringify({ pinned: [], folders: [{ id: 'f1', name: 'Trabajo', isOpen: true, chats: ['a'] }], isRecentOpen: true, links: {} }))
+  const ui = await bar($)
+  expect(await text(ui)).not.toContain('Luna')
+
+  // Otra terminal crea «Luna», mete «Cartera» y fija «Algo».
+  put(world, FILE, JSON.stringify({
+    pinned: ['a'],
+    folders: [
+      { id: 'f1', name: 'Trabajo', isOpen: true, chats: ['a'] },
+      { id: 'f2', name: 'Luna', isOpen: true, chats: ['b'] },
+    ],
+    isRecentOpen: true,
+    links: {},
+  }))
+  await clock.advance(1000)
+
+  const drawn = await text(ui)
+  expect(drawn).toContain('Luna')
+  expect(drawn).toContain('FIJADAS')
+})
+
+test('meter un chat en una carpeta no borra lo que otra sesión guardó antes', async ($, on) => {
+  const world: World = {
+    store: {},
+    runs: [],
+    env: {},
+    chats: [
+      { id: 'a', title: 'Algo', cwd: '/tmp', mtime: NOW },
+      { id: 'b', title: 'Cartera', cwd: '/tmp', mtime: NOW - 60_000 },
+    ],
+  }
+  engine(on, world)
+  put(world, FILE, JSON.stringify({ pinned: [], folders: [{ id: 'f1', name: 'Trabajo', isOpen: true, chats: [] }], isRecentOpen: true, links: {} }))
+  const ui = await bar($)
+
+  // Otra terminal crea «Luna» y mete «Algo» antes de que esta barra lo vea.
+  put(world, FILE, JSON.stringify({
+    pinned: [],
+    folders: [
+      { id: 'f1', name: 'Trabajo', isOpen: true, chats: [] },
+      { id: 'f2', name: 'Luna', isOpen: true, chats: ['a'] },
+    ],
+    isRecentOpen: true,
+    links: {},
+  }))
+  await ui.press({ key: 'mv-b' })
+  await ui.press({ key: 'in-f1' })
+
+  expect(foldersOf(world)).toEqual([
+    { id: 'f1', name: 'Trabajo', isOpen: true, chats: ['b'] },
+    { id: 'f2', name: 'Luna', isOpen: true, chats: ['a'] },
+  ])
+})
+
+test('la primera vez, el archivo compartido empieza con lo que había en el almacén', async ($, on) => {
+  const world: World = {
+    store: { folders: [{ id: 'f1', name: 'Trabajo', isOpen: true, chats: ['a'] }] satisfies Folder[], pinned: ['a'], recentOpen: false },
+    runs: [],
+    env: {},
+    chats: [
+      { id: 'a', title: 'Algo', cwd: '/tmp', mtime: NOW },
+      { id: 'b', title: 'Cartera', cwd: '/tmp', mtime: NOW - 60_000 },
+    ],
+  }
+  engine(on, world)
+  const ui = await bar($)
+  expect(shared(world)).toBeUndefined()
+  await ui.press({ key: 'recientes' })
+  expect(shared(world)).toEqual({
+    pinned: ['a'],
+    folders: [{ id: 'f1', name: 'Trabajo', isOpen: true, chats: ['a'] }],
+    isRecentOpen: true,
+    links: {},
+  })
 })

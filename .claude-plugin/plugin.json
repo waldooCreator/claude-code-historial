@@ -1,6 +1,6 @@
 {
   "name": "historial",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Barra lateral pixel art con las conversaciones recientes de Claude Code: fija las importantes, ordénalas en carpetas, crea y borra chats dentro de ellas y reábrelas en una pestaña nueva de tu terminal.",
   "author": { "name": "waldooCreator" }
 }

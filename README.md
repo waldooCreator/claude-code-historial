@@ -39,6 +39,7 @@ claude --plugin-dir ./claude-code-historial
 - × **Borrar un chat de una carpeta**: la `×` al lado del título pide confirmación y lo manda a la papelera, `~/.claude/historial-papelera`, de donde se puede recuperar. No deja borrar la conversación en la que estás.
 - ↺ **Sin duplicados al hacer `/clear`**: `/clear` empieza una conversación nueva y Claude Code le copia el nombre de la anterior, así que salían dos iguales. Ahora el historial las junta en un solo chat: muestra la sesión en uso y `↺ 1 antes` despliega las de antes del `/clear` para reabrirlas. Fijar, mover o borrar el chat lo hace con todas sus sesiones. Si el `/clear` empieza algo con otro nombre, queda como chat aparte.
 - 🖱️ **Reabrir**: un clic en el título abre `claude --resume` en una pestaña nueva de Ptyxis, en la carpeta donde se creó la conversación.
+- 🔄 **En todas tus terminales a la vez**: carpetas, fijadas y lo plegado se guardan en un solo archivo que comparten todas las sesiones. Lo que cambias en una terminal aparece en la barra abierta de las otras en un segundo, sin recargar, y ningún cambio pisa el de otra sesión.
 - `/historial` abre y cierra la barra desde el teclado.
 - 🦀 **Cabecera animada**: Clawd parpadea, salta y celebra junto a HISTORIAL, que crece con el ancho de la barra.
 
@@ -59,7 +60,7 @@ mv ~/.claude/historial-papelera/<proyecto>/<id>* ~/.claude/projects/<proyecto>/
 
 ## Privacidad
 
-Todo es local. El mod lee tus conversaciones de `~/.claude/projects`, guarda tus fijadas, carpetas y los enlaces de cada `/clear` en el almacén local de Claude Code, y solo mueve archivos cuando borras un chat (a la papelera, nunca los elimina). No envía nada a ningún sitio.
+Todo es local. El mod lee tus conversaciones de `~/.claude/projects`, guarda tus fijadas, carpetas y los enlaces de cada `/clear` en `~/.claude/historial/estado.json` (la primera vez lo llena con lo que había en el almacén local de Claude Code), y solo mueve archivos cuando borras un chat (a la papelera, nunca los elimina). No envía nada a ningún sitio.
 
 ## Licencia
 
