@@ -4,8 +4,11 @@ const PANE = 'historial'
 const LIMIT = 60
 const TICK_MS = 150
 
-type Chat = { id: string; title: string; cwd: string; mtime: number }
+type Chat = { id: string; title: string; cwd: string; mtime: number; path?: string; prev?: string }
 type Folder = { id: string; name: string; isOpen: boolean; chats: string[] }
+// One chat as the list shows it: the conversation in use and, newest first, the
+// ones a /clear left behind under the same name.
+type Group = { head: Chat; members: Chat[] }
 
 // Pixel palette, 0xRRGGBB.
 const C = {
@@ -47,6 +50,12 @@ let isRecentOpen = true
 let tick = 0
 let ticker: Timer | undefined
 let mounted: { columns: number; rows: number } | undefined
+// /clear links this mod saw happen: new session id → the one it cleared.
+let links: Record<string, string> = {}
+let groupOf = new Map<string, Group>()
+let expanded = new Set<string>()
+let deleting: string | undefined
+let currentId: string | undefined
 
 const age = (ms: number) => {
   const s = Math.max(0, (Date.now() - ms) / 1000)
@@ -164,6 +173,7 @@ async function load($: EngineInterface): Promise<void> {
   $.ui.invalidate('ui.render')
   try {
     pinned = ((await $.store.get('pinned')) as string[] | undefined) ?? []
+    links = ((await $.store.get('links')) as Record<string, string> | undefined) ?? {}
     isRecentOpen = (await $.store.get('recentOpen')) !== false
     folders = ((await $.store.get('folders')) as Folder[] | undefined) ?? []
     try {
@@ -213,6 +223,9 @@ function stopTicking(): void {
 
 async function frame($: EngineInterface): Promise<void> {
   tick++
+  // While the bar is open: what other sessions changed every 3 s, the list every 30 s.
+  if (tick % 200 === 0) void load($)
+  else if (tick % 20 === 0) void refresh($)
   const drawn = mounted
   if (!drawn) return
   const art = banner(drawn.columns, tick)
@@ -237,22 +250,70 @@ async function toggle($: EngineInterface): Promise<void> {
 }
 
 async function pin($: EngineInterface, id: string): Promise<void> {
-  pinned = pinned.includes(id) ? pinned.filter(p => p !== id) : [id, ...pinned]
+  const ids = idsOf(groupOf.get(id), id)
+  const now = ((await $.store.get('pinned')) as string[] | undefined) ?? pinned
+  pinned = now.some(p => ids.includes(p)) ? now.filter(p => !ids.includes(p)) : [id, ...now]
   await $.store.set('pinned', pinned)
   $.ui.invalidate('ui.render')
 }
 
-async function saveFolders($: EngineInterface, next: Folder[]): Promise<void> {
-  folders = next
+/** Changes the folders on top of what the store holds now: another session may have changed them. */
+async function saveFolders($: EngineInterface, change: (now: Folder[]) => Folder[]): Promise<void> {
+  const now = ((await $.store.get('folders')) as Folder[] | undefined) ?? folders
+  folders = change(now)
   await $.store.set('folders', folders)
   $.ui.invalidate('ui.render')
 }
+
+/** Rereads what other sessions may have changed: folders, pins and /clear links. */
+async function refresh($: EngineInterface): Promise<void> {
+  folders = ((await $.store.get('folders')) as Folder[] | undefined) ?? folders
+  pinned = ((await $.store.get('pinned')) as string[] | undefined) ?? pinned
+  links = ((await $.store.get('links')) as Record<string, string> | undefined) ?? links
+  $.ui.invalidate('ui.render')
+}
+
+/**
+ * Gathers each chat with the ones a /clear left behind. Claude Code copies a
+ * chat's name into the session a /clear starts, so two rows would read the
+ * same: they are one chat, shown once, its newest session on top.
+ */
+function groups(list: Chat[]): Group[] {
+  const byId = new Map(list.map(c => [c.id, c]))
+  const prevOf = (c: Chat) => {
+    const prev = byId.get(c.prev ?? links[c.id] ?? '')
+
+    return prev && prev.title === c.title ? prev : undefined
+  }
+  const rootOf = (c: Chat) => {
+    const seen = new Set<string>()
+    let at = c
+    for (let prev = prevOf(at); prev && !seen.has(prev.id); prev = prevOf(at)) {
+      seen.add(at.id)
+      at = prev
+    }
+
+    return at.id
+  }
+  const byRoot = new Map<string, Chat[]>()
+  for (const c of list) byRoot.set(rootOf(c), [...(byRoot.get(rootOf(c)) ?? []), c])
+  const out = [...byRoot.values()].map(members => {
+    const sorted = [...members].sort((a, b) => b.mtime - a.mtime)
+
+    return { head: sorted[0]!, members: sorted }
+  })
+  groupOf = new Map(out.flatMap(g => g.members.map(m => [m.id, g] as const)))
+
+  return out.sort((a, b) => b.head.mtime - a.head.mtime)
+}
+
+const idsOf = (g: Group | undefined, id: string) => (g ? g.members.map(m => m.id) : [id])
 
 async function createFolder($: EngineInterface, name: string): Promise<void> {
   isNaming = false
   const clean = name.trim().slice(0, 40)
   if (!clean) return $.ui.invalidate('ui.render')
-  await saveFolders($, [...folders, { id: `f${Date.now().toString(36)}`, name: clean, isOpen: true, chats: [] }])
+  await saveFolders($, now => [...now, { id: `f${Date.now().toString(36)}`, name: clean, isOpen: true, chats: [] }])
 }
 
 async function toggleRecent($: EngineInterface): Promise<void> {
@@ -262,11 +323,11 @@ async function toggleRecent($: EngineInterface): Promise<void> {
 }
 
 async function toggleFolder($: EngineInterface, id: string): Promise<void> {
-  await saveFolders($, folders.map(f => (f.id === id ? { ...f, isOpen: !f.isOpen } : f)))
+  await saveFolders($, now => now.map(f => (f.id === id ? { ...f, isOpen: !f.isOpen } : f)))
 }
 
 async function deleteFolder($: EngineInterface, id: string): Promise<void> {
-  await saveFolders($, folders.filter(f => f.id !== id))
+  await saveFolders($, now => now.filter(f => f.id !== id))
 }
 
 /** Puts the chat being moved into `target`, or out of every folder when undefined. */
@@ -274,10 +335,11 @@ async function dropInto($: EngineInterface, target: string | undefined): Promise
   const id = moving
   moving = undefined
   if (!id) return
-  await saveFolders(
-    $,
-    folders.map(f => {
-      const rest = f.chats.filter(c => c !== id)
+  // The chat moves whole: every session a /clear left behind goes with it.
+  const ids = idsOf(groupOf.get(id), id)
+  await saveFolders($, now =>
+    now.map(f => {
+      const rest = f.chats.filter(c => !ids.includes(c))
 
       return f.id === target ? { ...f, isOpen: true, chats: [id, ...rest] } : { ...f, chats: rest }
     }),
@@ -294,24 +356,113 @@ function startNaming($: EngineInterface): void {
   $.ui.invalidate('ui.render')
 }
 
-async function resume($: EngineInterface, chat: Chat): Promise<void> {
-  // A new tab in the Ptyxis window that is active (the one running Claude), in the chat's folder.
-  const script = `claude --resume ${quote(chat.id)}; exec bash`
+/** A new tab in the Ptyxis window that is active (the one running Claude), in `cwd`. */
+async function openTab($: EngineInterface, cwd: string, title: string, script: string): Promise<boolean> {
   const run = await $.process.run(
-    ['setsid', '-f', 'ptyxis', '--tab', '-d', chat.cwd, '-T', clip(chat.title, 30), '--', 'bash', '-ic', script],
+    ['setsid', '-f', 'ptyxis', '--tab', '-d', cwd, '-T', clip(title, 30), '--', 'bash', '-ic', `${script}; exec bash`],
     { timeoutMs: 8000 },
   )
-  $.ui.toast(run.exitCode === 0 ? `Abriendo «${clip(chat.title, 40)}»` : 'No pude abrir la terminal')
+
+  return run.exitCode === 0
+}
+
+async function resume($: EngineInterface, chat: Chat): Promise<void> {
+  const isOpened = await openTab($, chat.cwd, chat.title, `claude --resume ${quote(chat.id)}`)
+  $.ui.toast(isOpened ? `Abriendo «${clip(chat.title, 40)}»` : 'No pude abrir la terminal')
+}
+
+/**
+ * A new Claude session in a tab of its own that files itself into `folder`: the
+ * session reads HISTORIAL_CARPETA when it starts. It opens where the folder's
+ * latest chat works, or here when the folder is empty.
+ */
+async function newChatIn($: EngineInterface, folder: Folder): Promise<void> {
+  const latest = folder.chats
+    .map(id => groupOf.get(id)?.head ?? chats.find(c => c.id === id))
+    .filter((c): c is Chat => !!c)
+    .sort((a, b) => b.mtime - a.mtime)[0]
+  const cwd = latest?.cwd ?? (await $.session.cwd())
+  const isOpened = await openTab($, cwd, `nuevo · ${folder.name}`, `HISTORIAL_CARPETA=${quote(folder.id)} claude`)
+  $.ui.toast(isOpened ? `Chat nuevo en «${clip(folder.name, 30)}»` : 'No pude abrir la terminal')
+}
+
+/** Moves a chat (with the sessions a /clear left behind) to the trash, after a yes. */
+async function trash($: EngineInterface, id: string): Promise<void> {
+  deleting = undefined
+  const ids = idsOf(groupOf.get(id), id)
+  currentId = currentId ?? (await $.session.id())
+  if (ids.includes(currentId)) {
+    $.ui.toast('No puedo borrar la conversación en la que estás')
+
+    return $.ui.invalidate('ui.render')
+  }
+  const run = await $.process.run(['python3', '-I', `${$.plugin.root}/hooks/papelera.py`, ...ids], { timeoutMs: 15000 })
+  if (run.exitCode !== 0) {
+    $.ui.toast('No pude moverla a la papelera')
+
+    return $.ui.invalidate('ui.render')
+  }
+  await saveFolders($, now => now.map(f => ({ ...f, chats: f.chats.filter(c => !ids.includes(c)) })))
+  pinned = (((await $.store.get('pinned')) as string[] | undefined) ?? pinned).filter(p => !ids.includes(p))
+  await $.store.set('pinned', pinned)
+  chats = chats.filter(c => !ids.includes(c.id))
+  $.ui.toast('Movida a la papelera: ~/.claude/historial-papelera')
+  $.ui.invalidate('ui.render')
+}
+
+function askDelete($: EngineInterface, id: string | undefined): void {
+  deleting = id
+  $.ui.invalidate('ui.render')
+}
+
+function toggleExpanded($: EngineInterface, id: string): void {
+  expanded = new Set(expanded)
+  if (!expanded.delete(id)) expanded.add(id)
+  $.ui.invalidate('ui.render')
+}
+
+/** Remembers which session a /clear started from the one it ended. */
+async function linkClear($: EngineInterface, cleared: string): Promise<void> {
+  for (let tries = 0; tries < 10; tries++) {
+    await $.clock.sleep(300)
+    const now = await $.session.id()
+    if (now && now !== cleared) {
+      currentId = now
+      const saved = ((await $.store.get('links')) as Record<string, string> | undefined) ?? {}
+      links = { ...saved, [now]: cleared }
+      await $.store.set('links', links)
+
+      return
+    }
+  }
 }
 
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'historial', description: 'Abre o cierra la barra de conversaciones' })
+    currentId = await $.session.id()
+    // A chat opened with ＋ in a folder files itself there.
+    const target = await $.env.get('HISTORIAL_CARPETA')
+    if (target && e.isInteractive && currentId) {
+      const id = currentId
+      await saveFolders($, now =>
+        now.some(f => f.id === target) && !now.some(f => f.chats.includes(id))
+          ? now.map(f => (f.id === target ? { ...f, isOpen: true, chats: [id, ...f.chats] } : f))
+          : now,
+      )
+    }
     void load($)
 
     return next(e)
   })
+
+  // A /clear goes on under a new session: remember where it came from.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') void linkClear($, e.sessionId)
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'historial' }, async $ => {
     await toggle($)
@@ -349,37 +500,92 @@ export const register: Register = on => {
     const art = banner(columns, tick)
     mounted = { columns, rows: art.rows }
     startTicking($)
+    const all = groups(chats)
     const byId = new Map(chats.map(c => [c.id, c]))
-    const inFolder = new Set(folders.flatMap(f => f.chats))
-    const fixed = pinned.map(id => byId.get(id)).filter((c): c is Chat => !!c)
-    const rest = chats.filter(c => !pinned.includes(c.id) && !inFolder.has(c.id))
+    // A chat is pinned, or in a folder, when any of its sessions is.
+    const has = (ids: string[], g: Group) => g.members.some(m => ids.includes(m.id))
+    const folderOf = (g: Group) => folders.find(f => has(f.chats, g))
+    const isPinned = (g: Group) => has(pinned, g)
+    const fixed = all.filter(isPinned)
+    const rest = all.filter(g => !isPinned(g) && !folderOf(g))
     const room = Math.max(8, columns - 14)
-    const folderOf = (id: string) => folders.find(f => f.chats.includes(id))?.name
 
-    const row = (c: Chat, indent = '', tag = false) => (
-      <Box key={`row-${c.id}`} flexDirection="column" marginBottom={1}>
-        <Box flexDirection="row">
-          <Text>{indent}</Text>
-          <Button key={`pin-${c.id}`} plain onPress={() => void pin($, c.id)}>
-            <Text color={pinned.includes(c.id) ? C.star : C.muted}>{pinned.includes(c.id) ? '★' : '☆'}</Text>
-          </Button>
-          <Text> </Text>
-          <Button key={`mv-${c.id}`} plain onPress={() => startMove($, c.id)}>
-            <Text color={moving === c.id ? C.accent : C.muted}>{moving === c.id ? '▣' : '▢'}</Text>
-          </Button>
-          <Text> </Text>
-          <Button key={`go-${c.id}`} plain onPress={() => void resume($, c)}>
-            <Text color={C.text} weight="bold">{clip(c.title, room - indent.length)}</Text>
-          </Button>
+    const row = (g: Group, indent = '', options: { tag?: boolean; canDelete?: boolean } = {}) => {
+      const c = g.head
+      const older = g.members.length - 1
+      const isExpanded = expanded.has(c.id)
+
+      return (
+        <Box key={`row-${c.id}`} flexDirection="column" marginBottom={1}>
+          <Box flexDirection="row">
+            <Text>{indent}</Text>
+            <Button key={`pin-${c.id}`} plain onPress={() => void pin($, c.id)}>
+              <Text color={isPinned(g) ? C.star : C.muted}>{isPinned(g) ? '★' : '☆'}</Text>
+            </Button>
+            <Text> </Text>
+            <Button key={`mv-${c.id}`} plain onPress={() => startMove($, c.id)}>
+              <Text color={moving === c.id ? C.accent : C.muted}>{moving === c.id ? '▣' : '▢'}</Text>
+            </Button>
+            <Text> </Text>
+            <Button key={`go-${c.id}`} plain onPress={() => void resume($, c)}>
+              <Text color={C.text} weight="bold">{clip(c.title, room - indent.length - (options.canDelete ? 3 : 0))}</Text>
+            </Button>
+            {options.canDelete && (
+              <Button key={`del-${c.id}`} plain dimColor onPress={() => askDelete($, deleting === c.id ? undefined : c.id)}>
+                <Text color={deleting === c.id ? C.accent : C.muted}> ×</Text>
+              </Button>
+            )}
+          </Box>
+          <Box flexDirection="row">
+            <Text color={C.muted}>
+              {indent}
+              {'    ▪ '}
+              {clip(folder(c.cwd), Math.max(6, room - 22))} · {age(c.mtime)}
+              {options.tag && folderOf(g) ? ` · ▣ ${clip(folderOf(g)?.name ?? '', 14)}` : ''}
+            </Text>
+            {older > 0 && (
+              <Button key={`old-${c.id}`} plain dimColor onPress={() => toggleExpanded($, c.id)}>
+                <Text color={C.muted}> · ↺ {older} antes</Text>
+              </Button>
+            )}
+          </Box>
+          {isExpanded &&
+            g.members.slice(1).map(m => (
+              <Button key={`go-${m.id}`} plain dimColor onPress={() => void resume($, m)}>
+                <Text color={C.muted}>
+                  {indent}
+                  {'      ↺ antes del /clear · '}
+                  {age(m.mtime)}
+                </Text>
+              </Button>
+            ))}
+          {deleting === c.id && (
+            <Box flexDirection="column">
+              <Text color={C.text}>
+                {indent}
+                {'    ¿Borrar «'}
+                {clip(c.title, Math.max(6, room - 22))}
+                {older > 0 ? `» y sus ${older} sesiones de antes del /clear?` : '»?'}
+              </Text>
+              <Box flexDirection="row">
+                <Text>{indent}    </Text>
+                <Button key={`yes-${c.id}`} plain onPress={() => void trash($, c.id)}>
+                  <Text color="#e06c75">[ sí, borrar ]</Text>
+                </Button>
+                <Text> </Text>
+                <Button key={`no-${c.id}`} plain onPress={() => askDelete($, undefined)}>
+                  <Text color={C.muted}>[ cancelar ]</Text>
+                </Button>
+              </Box>
+              <Text color={C.muted}>
+                {indent}
+                {'    Va a ~/.claude/historial-papelera: se puede recuperar.'}
+              </Text>
+            </Box>
+          )}
         </Box>
-        <Text color={C.muted}>
-          {indent}
-          {'    ▪ '}
-          {clip(folder(c.cwd), Math.max(6, room - 14))} · {age(c.mtime)}
-          {tag && folderOf(c.id) ? ` · ▣ ${clip(folderOf(c.id) ?? '', 14)}` : ''}
-        </Text>
-      </Box>
-    )
+      )
+    }
 
     return (
       <Box flexDirection="column">
@@ -392,11 +598,11 @@ export const register: Register = on => {
           </Text>
         )}
         {fixed.length > 0 && <Text color={C.star}>▀▀ FIJADAS ▀▀</Text>}
-        {fixed.map(c => row(c, '', true))}
+        {fixed.map(g => row(g, '', { tag: true }))}
         <Text color={C.accent}>▀▀ CARPETAS ▀▀</Text>
         {folders.length === 0 && !isNaming && <Text color={C.muted}>  (aún no hay carpetas)</Text>}
         {folders.map(f => {
-          const inside = f.chats.map(id => byId.get(id)).filter((c): c is Chat => !!c && !pinned.includes(c.id))
+          const inside = all.filter(g => folderOf(g)?.id === f.id && !isPinned(g))
 
           return (
             <Box key={`fold-${f.id}`} flexDirection="column">
@@ -404,8 +610,13 @@ export const register: Register = on => {
                 <Button key={`tg-${f.id}`} plain onPress={() => void toggleFolder($, f.id)}>
                   <Text color={C.star}>{f.isOpen ? '▼' : '▶'} ▣ </Text>
                   <Text color={C.text} weight="bold">{clip(f.name, room - 8)}</Text>
-                  <Text color={C.muted}> ({f.chats.length})</Text>
+                  <Text color={C.muted}> ({inside.length})</Text>
                 </Button>
+                {!moving && (
+                  <Button key={`new-${f.id}`} plain onPress={() => void newChatIn($, f)}>
+                    <Text color={C.accent}> ＋ chat</Text>
+                  </Button>
+                )}
                 {moving && (
                   <Button key={`in-${f.id}`} plain onPress={() => void dropInto($, f.id)}>
                     <Text color={C.accent}> ⮑ aquí</Text>
@@ -417,7 +628,7 @@ export const register: Register = on => {
                   </Button>
                 )}
               </Box>
-              {f.isOpen && inside.map(c => row(c, '  '))}
+              {f.isOpen && inside.map(g => row(g, '  ', { canDelete: true }))}
               {f.isOpen && inside.length === 0 && <Text color={C.muted}>    (vacía)</Text>}
             </Box>
           )
@@ -433,13 +644,17 @@ export const register: Register = on => {
           <Text color={C.accent}>{isRecentOpen ? '▼' : '▶'} ▀▀ RECIENTES ▀▀</Text>
           <Text color={C.muted}> ({rest.length})</Text>
         </Button>
-        {moving && inFolder.has(moving) && (
+        {moving && (() => {
+          const g = groupOf.get(moving)
+
+          return g ? !!folderOf(g) : false
+        })() && (
           <Button key="out" plain onPress={() => void dropInto($, undefined)}>
             <Text color={C.accent}>⮑ sacar de su carpeta</Text>
           </Button>
         )}
-        {isRecentOpen && rest.map(c => row(c))}
-        <Text color={C.muted}>▄▄▄ {chats.length} conversaciones ▄▄▄</Text>
+        {isRecentOpen && rest.map(g => row(g))}
+        <Text color={C.muted}>▄▄▄ {all.length} conversaciones ▄▄▄</Text>
       </Box>
     )
   })

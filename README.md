@@ -35,6 +35,9 @@ claude --plugin-dir ./claude-code-historial
 - 🕘 **Recientes**: lee `~/.claude/projects` y lista las conversaciones de la más nueva a la más vieja, con el resumen del tema como título, la carpeta del proyecto y hace cuánto fue. Un clic en `▼ RECIENTES` pliega la lista y lo recuerda.
 - ★ **Fijadas**: la estrella fija una conversación para que salga siempre arriba.
 - ▣ **Carpetas**: crea carpetas con `＋ nueva carpeta`, ábrelas y ciérralas con un clic. Para meter un chat, pulsa su `▢` y luego `⮑ aquí` en la carpeta; `⮑ sacar de su carpeta` lo devuelve a recientes.
+- ＋ **Chat nuevo en una carpeta**: `＋ chat`, junto al nombre de la carpeta, abre una sesión nueva de Claude en una pestaña de Ptyxis, en la carpeta de trabajo de su chat más reciente, y la guarda sola en esa carpeta.
+- × **Borrar un chat de una carpeta**: la `×` al lado del título pide confirmación y lo manda a la papelera, `~/.claude/historial-papelera`, de donde se puede recuperar. No deja borrar la conversación en la que estás.
+- ↺ **Sin duplicados al hacer `/clear`**: `/clear` empieza una conversación nueva y Claude Code le copia el nombre de la anterior, así que salían dos iguales. Ahora el historial las junta en un solo chat: muestra la sesión en uso y `↺ 1 antes` despliega las de antes del `/clear` para reabrirlas. Fijar, mover o borrar el chat lo hace con todas sus sesiones. Si el `/clear` empieza algo con otro nombre, queda como chat aparte.
 - 🖱️ **Reabrir**: un clic en el título abre `claude --resume` en una pestaña nueva de Ptyxis, en la carpeta donde se creó la conversación.
 - `/historial` abre y cierra la barra desde el teclado.
 - 🦀 **Cabecera animada**: Clawd parpadea, salta y celebra junto a HISTORIAL, que crece con el ancho de la barra.
@@ -46,9 +49,17 @@ La barra se acopla al lado del chat en pantalla completa con 110 columnas o más
 - Linux con [Ptyxis](https://gitlab.gnome.org/chergert/ptyxis) (la terminal de Fedora). Con otra terminal hay que cambiar el comando de `resume` en `hooks/register.tsx`.
 - `python3` (lee los archivos de las conversaciones; no instala nada).
 
+### Recuperar un chat borrado
+
+Cada chat borrado queda en `~/.claude/historial-papelera/<proyecto>/<id>.jsonl` (con su carpeta de subagentes, si la tenía). Para devolverlo, muévelo de vuelta a la misma carpeta dentro de `~/.claude/projects/`:
+
+```bash
+mv ~/.claude/historial-papelera/<proyecto>/<id>* ~/.claude/projects/<proyecto>/
+```
+
 ## Privacidad
 
-Todo es local. El mod solo lee tus conversaciones de `~/.claude/projects` y guarda tus fijadas y carpetas en el almacén local de Claude Code. No envía nada a ningún sitio.
+Todo es local. El mod lee tus conversaciones de `~/.claude/projects`, guarda tus fijadas, carpetas y los enlaces de cada `/clear` en el almacén local de Claude Code, y solo mueve archivos cuando borras un chat (a la papelera, nunca los elimina). No envía nada a ningún sitio.
 
 ## Licencia
 
